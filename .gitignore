@@ -1,0 +1,6 @@
+# Office creates these lock files while documents are open.
+~$*
+
+# Python-generated cache files.
+__pycache__/
+*.py[cod]
