@@ -171,7 +171,7 @@ button:focus-visible {
   background-image:
     linear-gradient(90deg, rgba(17, 22, 51, 0.99) 0%, rgba(17, 22, 51, 0.92) 40%, rgba(17, 22, 51, 0.28) 100%),
     linear-gradient(0deg, var(--night) 0%, transparent 36%),
-    url("assets/environment/moon_site.png");
+    url("assets/environment/site_equator.png");
   background-position: center, center, center 55%;
   background-size: cover;
 }
@@ -333,7 +333,7 @@ p {
   border-radius: 32px;
   background:
     linear-gradient(180deg, rgba(22, 29, 66, 0.1), rgba(17, 22, 51, 0.17)),
-    url("assets/environment/moon_site.png") center / cover;
+    url("assets/environment/site_equator.png") center / cover;
   box-shadow: 0 28px 80px rgba(4, 7, 23, 0.35);
 }
 

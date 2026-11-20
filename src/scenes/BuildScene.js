@@ -1,410 +1,257 @@
-/* STAGE 2 - BUILD: place and activate the five structures.
- *
- * Per building:  choose card -> Select location -> click a valid pad
- *                -> Place / Activate -> build progress -> ready / active
- * Greenhouse stays locked ("Need resources") until power AND supplies exist.
- */
+/* STAGE 2 - BUILD: spend supply crates on buildings and place them on pads.
+ * Pad traits (flat / sunny / shaded) decide what fits and give bonuses. The layout
+ * becomes the input of the mission simulation. */
 (function () {
   const NS = (window.OUTPOST = window.OUTPOST || {});
-  const T = (ms) => (NS.FAST ? ms * 0.15 : ms);
-  const CARD_X = 95, CARD_Y0 = 175, CARD_DY = 97;
-  const BTN_MAIN = { x: 860, y: 660 }, BTN_SIDE = { x: 1150, y: 660 };
+  const CARD_X = 24, CARD_Y0 = 124, CARD_W = 200, CARD_H = 62, CARD_GAP = 6;
 
   class BuildScene extends Phaser.Scene {
     constructor() { super('Build'); }
 
     create() {
-      const C = NS.C;
-      const S = NS.state;
-      if (!S.site) S.site = NS.AREAS[0];
+      const CT = NS.CONTENT;
+      const M = NS.mission();
+      this.M = M;
+      if (!NS.run.siteId) NS.run.siteId = M.sites.find((s) => CT.SITES[s].safe);
+      this.site = CT.SITES[NS.run.siteId];
+      this.tags = CT.PAD_SETS[this.site.padSet];
       this.cameras.main.fadeIn(400);
-      NS.put(this, 'bg.site', 0, 0).setDepth(-100);
+      NS.put(this, 'bg.site.' + M.map, 0, 0).setDepth(-100);
+      if (M.map !== 'mars') NS.twinkles(this, 20, { x: 0, y: 0, w: NS.W, h: 180 }, -90);
+      this.focus = new NS.Focus(this);
 
-      this.mode = 'idle'; // idle | selected | select | located | building | won
-      this.sel = null; // building id being worked on
-      this.ghost = null; // sprite shown while choosing / building
-      this.pad = null; // pad chosen for the current building
-      this.hoverPad = null;
-      this.sites = {}; // id -> { pad, img }
-      this.pads = NS.PADS.map((p, i) => Object.assign({ i, occupant: null }, p));
+      this.sel = null; this.picked = null; this.hoverPad = null;
+      this.sprites = []; this.layout = [];
 
-      this.ringG = this.add.graphics().setDepth(-50);
-      this.hoverMarker = NS.put(this, 'marker.valid', 0, 0).setVisible(false).setDepth(2000);
-
-      // pads: hit zones + little tag labels shown while choosing a location
-      this.pads.forEach((p) => {
-        p.label = NS.text(this, p.x, p.y + 40, p.tags.join(' · '), 13, NS.C.slateHex)
-          .setOrigin(0.5).setDepth(20).setVisible(false)
-          .setBackgroundColor(NS.C.creamHex).setPadding(8, 2, 8, 2);
-        const z = this.add.zone(p.x, p.y - 10, 190, 80).setInteractive({ useHandCursor: true }).setDepth(60);
-        z.on('pointerover', () => this.onPadOver(p));
-        z.on('pointerout', () => this.onPadOut(p));
-        z.on('pointerdown', () => this.onPadClick(p));
+      this.ringG = this.add.graphics().setDepth(-40);
+      this.padLabels = NS.PADS.map((p, i) => {
+        const t = NS.text(this, p.x, p.y + 34, this.tags[i].join(' · '), 13, '#ffffff').setOrigin(0.5).setDepth(15).setStroke(NS.C.inkHex, 4);
+        const z = this.add.zone(p.x, p.y - 10, 190, 90).setInteractive({ useHandCursor: true }).setDepth(60);
+        z.on('pointerover', () => { this.hoverPad = i; this.explainPad(i); });
+        z.on('pointerout', () => { if (this.hoverPad === i) this.hoverPad = null; });
+        z.on('pointerdown', () => this.onPad(i));
+        return t;
       });
 
-      // crew (three astronauts) waits at the landing corner of the site
       this.crew = NS.CREW.map((n, i) => {
-        const home = { x: 250 + i * 62, y: 592 + (i % 2) * 8 };
+        const home = { x: 60 + i * 52, y: 690 - (i % 2) * 8 };
         const a = NS.makeAstronaut(this, n, home.x, home.y);
         a.home = home;
         return a;
       });
 
-      this.guide = NS.createGuide(this, 24, 28, 640);
+      this.guide = NS.createGuide(this, 240, 24, 610);
       this.buildHud();
       this.buildCards();
       this.buildPanel();
-      this.setMode('idle');
-      this.guide.say(NS.STORY.buildWelcome.replace('{site}', S.site.name));
+      (NS.run.layout || []).forEach((b) => this.place(b.type, b.pad, true));
+      this.refresh();
+      this.guide.say('Welcome to ' + this.site.name + '! We have ' + M.budget + ' supply crates. Pick a building card, then a glowing spot.', { expr: 'talk' });
+      this.input.keyboard.on('keydown', (ev) => {
+        if (ev.key === 'Escape') { this.sel = null; this.picked = null; this.refresh(); }
+        if (ev.key === 'Delete' || ev.key === 'Backspace') this.removePicked();
+      });
       window.__outpost = Object.assign(window.__outpost || {}, { build: this });
     }
 
-    // ------------------------------------------------------------------ HUD
     buildHud() {
-      const S = NS.state;
-      this.hudText = NS.text(this, 1256, 24, '', 15, NS.C.creamHex).setOrigin(1, 0).setDepth(3001);
-      this.dotsG = this.add.graphics().setDepth(3001);
-      this.hud = {};
-      NS.RESOURCES.forEach((r, i) => {
-        const img = NS.put(this, r.chip, 1256 - 92, 112 + i * 40).setDepth(3001);
-        img.setScale(184 / img.width);
-        this.hud[r.key] = img;
-        if (S.res[r.key]) NS.litChip(this, img); else NS.dimChip(img);
-      });
-      this.refreshHud();
-    }
-    refreshHud() {
-      const S = NS.state;
-      const n = NS.BUILD_ORDER.filter((id) => S.built[id]).length;
-      this.hudText.setText('Stage 2 of 5 · Build   ' + n + ' / 5');
-      const g = this.dotsG; g.clear();
-      NS.BUILD_ORDER.forEach((id, i) => {
-        const x = 1256 - 12 - (4 - i) * 30, y = 62;
-        g.fillStyle(S.built[id] ? NS.C.green : 0xdcdfe8, 1).fillCircle(x, y, 10);
-        g.lineStyle(3, NS.C.navy, 1).strokeCircle(x, y, 10);
-      });
+      NS.glass(this, 872, 18, 384, 184, { r: 18 }).setDepth(3000);
+      NS.text(this, 1240, 26, NS.stageLabel('Build'), 13, NS.C.dimHex).setOrigin(1, 0).setDepth(3001);
+      NS.icon(this, 'crate', 906, 70, 34).setDepth(3001);
+      this.budgetText = NS.title(this, 932, 52, '', 26, '#ffffff', false).setDepth(3001);
+      NS.text(this, 934, 86, 'supply crates left', 14, NS.C.dimHex).setDepth(3001);
+      this.budgetBar = this.add.graphics().setDepth(3001);
+      NS.text(this, 892, 130, 'MUST BUILD', 13, '#7df9ff').setDepth(3001);
+      this.reqTexts = this.M.required.map((t, i) => NS.text(this, 892 + (i % 2) * 180, 150 + Math.floor(i / 2) * 24, '', 16, '#ffffff').setDepth(3001));
     }
 
-    // ---------------------------------------------------------------- cards
     buildCards() {
-      this.cardG = this.add.graphics().setDepth(3002);
-      this.cards = {};
-      NS.BUILD_ORDER.forEach((id, i) => {
-        const x = CARD_X, y = CARD_Y0 + i * CARD_DY;
-        const img = NS.put(this, 'card.' + id, x, y).setDepth(3001);
-        const base = img.scaleX;
-        img.setInteractive({ useHandCursor: true });
-        img.on('pointerover', () => img.setScale(base * 1.04));
-        img.on('pointerout', () => img.setScale(base));
-        img.on('pointerdown', () => this.selectBuilding(id));
-        this.cards[id] = { img, x, y };
-      });
-      this.refreshCards();
-    }
-    refreshCards() {
-      const g = this.cardG; g.clear();
-      NS.BUILD_ORDER.forEach((id) => {
-        const c = this.cards[id];
-        const w = c.img.displayWidth, h = c.img.displayHeight;
-        c.img.setAlpha(this.mode === 'building' && this.sel !== id ? 0.55 : 1);
-        if (this.sel === id && this.mode !== 'idle' && this.mode !== 'won') {
-          g.lineStyle(6, NS.C.teal, 1).strokeRoundedRect(c.x - w / 2 - 5, c.y - h / 2 - 5, w + 10, h + 10, 18);
-        }
-        if (NS.state.built[id]) {
-          const bx = c.x + w / 2 - 6, by = c.y - h / 2 + 8;
-          g.fillStyle(NS.C.green, 1).fillCircle(bx, by, 13);
-          g.lineStyle(3, NS.C.navy, 1).strokeCircle(bx, by, 13);
-          g.lineStyle(4, NS.C.navy, 1).beginPath().moveTo(bx - 5, by).lineTo(bx - 1, by + 4).lineTo(bx + 6, by - 4).strokePath();
-        }
+      this.cards = this.M.buildings.map((id, i) => {
+        const B = NS.CONTENT.BUILDINGS[id];
+        const x = CARD_X, y = CARD_Y0 + i * (CARD_H + CARD_GAP);
+        const g = this.add.graphics().setDepth(3000);
+        const img = this.add.image(x + 36, y + CARD_H / 2 + 2, 'building.' + id + '.ready').setDepth(3001);
+        img.setScale(Math.min(64 / img.width, 52 / img.height) * 1.25);
+        const name = NS.title(this, x + 74, y + 7, B.short, 19, '#ffffff', false).setDepth(3001);
+        const crate = NS.icon(this, 'crate', x + 84, y + 44, 16).setDepth(3001);
+        const cost = NS.text(this, x + 96, y + 34, String(B.cost), 16, '#ffd23f').setDepth(3001);
+        const count = NS.text(this, x + CARD_W - 12, y + 35, '', 14, NS.C.dimHex).setOrigin(1, 0).setDepth(3001);
+        const zone = this.add.zone(x + CARD_W / 2, y + CARD_H / 2, CARD_W, CARD_H).setInteractive({ useHandCursor: true }).setDepth(3002);
+        zone.on('pointerdown', () => { NS.sfx('click'); this.selectCard(id); });
+        return { id, x, y, g, img, name, cost, crate, count };
       });
     }
 
-    // ---------------------------------------------------------------- panel
+    drawCards() {
+      const E = NS.ENGINE;
+      this.cards.forEach((c) => {
+        const B = NS.CONTENT.BUILDINGS[c.id];
+        const n = this.layout.filter((b) => b.type === c.id).length;
+        const affordable = E.layoutCost(this.layout) + B.cost <= this.M.budget && n < B.max && (!B.needsIce || this.site.ice);
+        const sel = this.sel === c.id;
+        const g = c.g; g.clear();
+        g.fillStyle(0x0b0626, 0.4).fillRoundedRect(c.x + 3, c.y + 5, CARD_W, CARD_H, 14);
+        g.fillStyle(sel ? 0x2e6e8a : NS.C.glass, 0.92).fillRoundedRect(c.x, c.y, CARD_W, CARD_H, 14);
+        g.lineStyle(sel ? 4 : 2, sel ? 0xffd23f : NS.C.edge, sel ? 1 : 0.55).strokeRoundedRect(c.x, c.y, CARD_W, CARD_H, 14);
+        if (this.M.required.includes(c.id) && n === 0) g.fillStyle(NS.C.orange, 1).fillCircle(c.x + CARD_W - 12, c.y + 12, 6);
+        c.count.setText(n + '/' + B.max + (B.needsIce && !this.site.ice ? ' · no ice' : ''));
+        [c.img, c.name, c.cost, c.crate, c.count].forEach((o) => o.setAlpha(affordable || sel || n ? 1 : 0.45));
+      });
+    }
+
     buildPanel() {
-      NS.panel(this, 190, 612, 1066, 96).setDepth(3000);
-      this.pTitle = NS.text(this, 214, 622, '', 15, NS.C.slateHex).setDepth(3001);
-      this.pBody = NS.text(this, 214, 644, '', 19, NS.C.navyHex, '700').setDepth(3001).setWordWrapWidth(470);
-      this.btnMain = NS.imgButton(this, 'btn.selectLocation', BTN_MAIN.x, BTN_MAIN.y, () => this.onMain()).setDepth(3001);
-      this.btnSide = NS.imgButton(this, 'btn.cancel', BTN_SIDE.x, BTN_SIDE.y, () => this.onSide()).setDepth(3001);
-      this.reqChips = [];
-    }
-    clearReqChips() { this.reqChips.forEach((c) => c.destroy()); this.reqChips = []; }
-    resOk(id) {
-      const B = NS.BUILDINGS[id];
-      return (B.requires || []).every((r) => NS.state.res[r]);
+      NS.glass(this, 240, 612, 1016, 96).setDepth(3000);
+      this.pTitle = NS.text(this, 264, 622, '', 15, '#7df9ff').setDepth(3001);
+      this.pBody = NS.text(this, 264, 644, '', 18, '#ffffff', '700').setDepth(3001).setWordWrapWidth(560).setLineSpacing(2);
+      this.btnRemove = NS.button(this, 910, 660, 170, 58, 'Remove', () => this.removePicked(), { color: NS.C.orange }).setDepth(3001);
+      this.btnStart = NS.button(this, 1120, 660, 236, 64, 'Start mission', () => this.start(), { color: NS.C.green, icon: 'flag', sound: 'unlock' }).setDepth(3001);
     }
 
-    setMode(mode) {
-      this.mode = mode;
-      const B = this.sel && NS.BUILDINGS[this.sel];
-      const main = this.btnMain, side = this.btnSide;
-      const vis = (b, on) => { b.setVisible(on); if (on) b.setInteractive({ useHandCursor: true }); else b.disableInteractive(); };
-      this.clearReqChips();
-
-      if (mode === 'idle' || mode === 'won') {
-        this.pTitle.setText('BUILD YOUR MOON CAMP');
-        this.pBody.setText(NS.state.built.crew ? 'Pick the next part of Moon Camp.' : 'Choose a building to get Moon Camp started.');
-        vis(main, false); vis(side, false);
-      } else if (mode === 'selected') {
-        this.pTitle.setText(B.name.toUpperCase());
-        this.pBody.setText(B.intro.length > 80 ? B.intro : B.intro);
-        main.setKey('btn.selectLocation').setEnabled(true); vis(main, true);
-        side.setKey('btn.cancel'); vis(side, true);
-      } else if (mode === 'select') {
-        this.pTitle.setText('01  SELECT LOCATION · ' + B.name.toUpperCase());
-        this.pBody.setText(B.select + '. Tap or click a green pad to choose a spot.');
-        vis(main, false);
-        side.setKey('btn.cancel'); vis(side, true);
-      } else if (mode === 'located') {
-        this.pTitle.setText('LOCATION SET · ' + B.name.toUpperCase());
-        const ok = this.resOk(this.sel);
-        this.pBody.setText(ok ? 'Ready when you are.' : 'This spot is reserved. The greenhouse needs power and supplies first.');
-        main.setKey(ok ? B.action : 'btn.needResources').setEnabled(ok); vis(main, true);
-        side.setKey('btn.cancel'); vis(side, true);
-      } else if (mode === 'building') {
-        this.pTitle.setText('02  BUILD IN PROGRESS');
-        this.pBody.setText(B.working + '…');
-        vis(main, false); vis(side, false);
+    selectCard(id) {
+      const B = NS.CONTENT.BUILDINGS[id];
+      this.picked = null;
+      this.sel = this.sel === id ? null : id;
+      if (this.sel) {
+        const n = this.layout.filter((b) => b.type === id).length;
+        let msg = B.about, expr = 'talk';
+        if (B.needsIce && !this.site.ice) { msg = 'There is no ice at ' + this.site.name + ', so the Ice Digger can’t work here.'; expr = 'worried'; }
+        else if (n >= B.max) msg = 'You already built ' + B.max + '. ' + B.about;
+        else if (NS.ENGINE.layoutCost(this.layout) + B.cost > this.M.budget) { msg = 'Not enough crates! Remove something to free up supplies.'; expr = 'worried'; }
+        else msg += ' Pick a glowing spot.';
+        this.guide.say(B.name + '. ' + msg, { expr });
       }
-
-      // greenhouse: show what it still needs
-      if (B && this.sel === 'greenhouse' && (mode === 'selected' || mode === 'select' || mode === 'located')) {
-        (B.requires || []).forEach((r, i) => {
-          const have = NS.state.res[r];
-          const chip = NS.put(this, have ? NS.HAVE_CHIP[r] : NS.NEEDS_CHIP[r], 214 + 75 + i * 160, 694).setDepth(3001);
-          chip.setScale(150 / chip.width);
-          this.reqChips.push(chip);
-        });
-        this.pBody.setWordWrapWidth(470);
-      }
-      this.refreshCards();
+      this.refresh();
     }
 
-    // ------------------------------------------------------------ choosing
-    selectBuilding(id) {
-      if (this.mode === 'building' || this.mode === 'won') return;
-      if (NS.state.built[id]) { NS.toast(this, NS.BUILDINGS[id].name + ' is already built', NS.C.cream); return; }
-      this.dropGhost();
-      this.sel = id; this.pad = null;
-      const B = NS.BUILDINGS[id];
-      this.guide.say(B.intro);
-      this.setMode('selected');
+    explainPad(i) {
+      if (!this.sel) return;
+      const r = NS.ENGINE.canPlace(this.M.id, NS.run.siteId, this.layout, this.sel, i);
+      const B = NS.CONTENT.BUILDINGS[this.sel];
+      let bonus = '';
+      if (r.ok && B.bonusTag && this.tags[i].includes(B.bonusTag)) bonus = this.sel === 'solar' ? ' Sunny spot: +1 power!' : ' Shaded spot: +1 shield!';
+      this.pTitle.setText(B.name.toUpperCase() + ' · SPOT ' + (i + 1) + ' (' + this.tags[i].join(', ') + ')');
+      this.pBody.setText(r.ok ? 'Good spot.' + bonus : 'Can’t build here: ' + r.reason + '.');
     }
 
-    dropGhost() {
-      if (this.ghost) { this.ghost.destroy(); this.ghost = null; }
-      this.hoverMarker.setVisible(false);
-    }
-
-    onMain() {
-      if (this.mode === 'selected') {
-        this.guide.say(NS.BUILDINGS[this.sel].select + '! Tap or click a green pad.');
-        this.setMode('select');
-      } else if (this.mode === 'located') {
-        if (this.resOk(this.sel)) this.startConstruction();
-      }
-    }
-    onSide() {
-      if (this.mode === 'selected') { this.sel = null; this.setMode('idle'); this.guide.say('Pick any building from the list.'); }
-      else if (this.mode === 'select') { this.setMode('selected'); }
-      else if (this.mode === 'located') {
-        this.dropGhost(); this.pad = null;
-        this.guide.say(NS.BUILDINGS[this.sel].select + '! Tap or click a green pad.');
-        this.setMode('select');
-      }
-    }
-
-    padValid(p) { return !p.occupant && p.tags.indexOf(NS.BUILDINGS[this.sel].needs) >= 0; }
-    padWhy(p) {
-      if (p.occupant) return 'something is already built there';
-      return NS.TAG_WHY[NS.BUILDINGS[this.sel].needs];
-    }
-
-    onPadOver(p) {
-      if (this.mode !== 'select') return;
-      this.hoverPad = p;
-      const ok = this.padValid(p);
-      NS.retexture(this.hoverMarker, ok ? 'marker.valid' : 'marker.invalid');
-      this.hoverMarker.setPosition(p.x, p.y).setVisible(true);
-    }
-    onPadOut(p) {
-      if (this.hoverPad === p) { this.hoverPad = null; this.hoverMarker.setVisible(false); }
-    }
-
-    onPadClick(p) {
-      if (this.mode !== 'select') return;
-      const id = this.sel, B = NS.BUILDINGS[id];
-      if (!this.padValid(p)) {
-        NS.retexture(this.hoverMarker, 'marker.invalid');
-        this.hoverMarker.setPosition(p.x, p.y).setVisible(true);
-        this.tweens.add({ targets: this.hoverMarker, x: p.x + 7, yoyo: true, repeat: 3, duration: 55, onComplete: () => this.hoverMarker.setX(p.x) });
-        this.guide.say("We can't place the " + B.name + ' here: ' + this.padWhy(p) + '. Try a green pad.');
+    onPad(i) {
+      const at = this.layout.findIndex((b) => b.pad === i);
+      if (!this.sel) { this.picked = at >= 0 ? at : null; this.refresh(); return; }
+      const r = NS.ENGINE.canPlace(this.M.id, NS.run.siteId, this.layout, this.sel, i);
+      if (!r.ok) {
+        NS.sfx('error');
+        this.guide.say('Hmm, we can’t build there: ' + r.reason + '.', { expr: 'worried' });
+        this.cameras.main.shake(120, 0.004);
         return;
       }
-      this.pad = p;
-      this.hoverMarker.setVisible(false);
-      this.ghost = NS.put(this, 'building.' + id + '.ghost', p.x, p.y).setDepth(p.y).setAlpha(0);
-      this.tweens.add({ targets: this.ghost, alpha: 1, duration: 260 });
-      this.setMode('located');
-      const need = !this.resOk(id);
-      this.guide.say(need
-        ? "Nice spot! We'll reserve it, but we need power and supplies before the greenhouse can start."
-        : 'Good spot! Press the button when you are ready.');
+      this.place(this.sel, i);
+      const B = NS.CONTENT.BUILDINGS[this.sel];
+      const n = this.layout.filter((b) => b.type === this.sel).length;
+      if (n >= B.max || NS.ENGINE.layoutCost(this.layout) + B.cost > this.M.budget) this.sel = null;
+      this.refresh();
     }
 
-    // --------------------------------------------------------- construction
-    startConstruction() {
-      const id = this.sel, B = NS.BUILDINGS[id], p = this.pad;
-      p.occupant = id;
-      this.sites[id] = { pad: p, img: this.ghost };
-      this.setMode('building');
-      this.guide.say(B.working + '…');
-      NS.retexture(this.ghost, 'building.' + id + '.build');
+    place(type, pad, instant) {
+      const p = NS.PADS[pad];
+      const img = NS.put(this, 'building.' + type + '.ready', p.x, p.y + 10).setDepth(p.y);
+      img.setInteractive({ useHandCursor: true });
+      img.on('pointerdown', () => { if (!this.sel) { this.picked = this.layout.findIndex((b) => b.pad === pad); this.refresh(); } });
+      this.layout.push({ type, pad });
+      this.sprites.push(img);
+      if (!instant) {
+        const s = img.scaleX;
+        img.setScale(s * 0.2).setAlpha(0.3);
+        this.tweens.add({ targets: img, scaleX: s, scaleY: s, alpha: 1, duration: 420, ease: 'Back.easeOut' });
+        NS.dust(this, p.x, p.y + 10, this.M.body === 'mars' ? 0xf0b08a : 0xe0dafa);
+        NS.sfx('build');
+        const worker = this.crew[this.layout.length % 3];
+        worker.walkTo(p.x - 70, p.y + 30, () => this.time.delayedCall(600, () => worker.walkTo(worker.home.x, worker.home.y)));
+        NS.toast(this, NS.CONTENT.BUILDINGS[type].short + ' built!', NS.C.green);
+      }
+    }
 
-      // progress bar floating above the site
-      const bx = p.x, by = p.y - 168;
-      const barG = this.add.graphics().setDepth(2500);
-      const label = NS.text(this, bx, by - 20, '', 15).setOrigin(0.5).setDepth(2501)
-        .setBackgroundColor(NS.C.creamHex).setPadding(10, 3, 10, 3);
-      const draw = (v) => {
-        barG.clear();
-        barG.fillStyle(NS.C.navy, 1).fillRoundedRect(bx - 80, by - 6, 160, 20, 10);
-        barG.fillStyle(0xdcdfe8, 1).fillRoundedRect(bx - 78, by - 4, 156, 16, 8);
-        if (v > 0.02) barG.fillStyle(0x8fe27a, 1).fillRoundedRect(bx - 78, by - 4, Math.max(14, 156 * v), 16, 8);
-        label.setText(v >= 1 ? 'Build complete' : 'Building · ' + Math.round(v * 100) + '%');
-      };
-      draw(0);
+    removePicked() {
+      if (this.picked == null) return;
+      const b = this.layout[this.picked];
+      this.sprites[this.picked].destroy();
+      this.layout.splice(this.picked, 1);
+      this.sprites.splice(this.picked, 1);
+      NS.sfx('off');
+      this.guide.say(NS.CONTENT.BUILDINGS[b.type].short + ' removed. Crates returned!', { expr: 'happy' });
+      this.picked = null;
+      this.refresh();
+    }
 
-      // the nearest astronaut walks over to work on it
-      const worker = this.crew.slice().sort((a, b) => Phaser.Math.Distance.Between(a.x, a.y, p.x, p.y) - Phaser.Math.Distance.Between(b.x, b.y, p.x, p.y))[0];
-      this.worker = worker;
-      worker.walkTo(p.x + 70, Math.min(p.y + 34, 596));
+    start() {
+      if (!NS.ENGINE.validateLayout(this.M.id, NS.run.siteId, this.layout).ok) return;
+      NS.run.layout = this.layout.map((b) => ({ type: b.type, pad: b.pad }));
+      NS.run.history = [];
+      NS.go(this, 'Mission');
+    }
 
-      const prog = { v: 0 };
-      this.tweens.add({
-        targets: prog, v: 1, duration: T(B.seconds * 1000), ease: 'Linear',
-        onUpdate: () => draw(prog.v),
-        onComplete: () => {
-          draw(1);
-          this.time.delayedCall(T(600), () => this.tweens.add({ targets: [barG, label], alpha: 0, duration: 300, onComplete: () => { barG.destroy(); label.destroy(); } }));
-          this.finish(id);
-        },
+    refresh() {
+      const E = NS.ENGINE, CT = NS.CONTENT;
+      const cost = E.layoutCost(this.layout);
+      this.budgetText.setText((this.M.budget - cost) + ' / ' + this.M.budget);
+      const g = this.budgetBar; g.clear();
+      g.fillStyle(0x3a2f7a, 1).fillRoundedRect(892, 108, 344, 10, 5);
+      g.fillStyle(0xe5a96a, 1).fillRoundedRect(892, 108, 344 * (this.M.budget - cost) / this.M.budget, 10, 5);
+      this.M.required.forEach((t, i) => {
+        const ok = this.layout.some((b) => b.type === t);
+        this.reqTexts[i].setText((ok ? '✓ ' : '○ ') + CT.BUILDINGS[t].short).setColor(ok ? '#9dff8a' : '#ffb38a');
       });
+      this.drawCards();
+      this.sprites.forEach((s, i) => s.setTint(i === this.picked ? 0xffe9a8 : 0xffffff));
+      const v = E.validateLayout(this.M.id, NS.run.siteId, this.layout);
+      this.btnStart.setEnabled(v.ok);
+      if (v.ok && !this._pulsing) { this._pulsing = this.btnStart.pulse(); }
+      this.btnRemove.setVisible(this.picked != null);
+      this.padLabels.forEach((t) => t.setVisible(!!this.sel));
+      if (this.picked != null) {
+        const B = CT.BUILDINGS[this.layout[this.picked].type];
+        this.pTitle.setText(B.name.toUpperCase());
+        this.pBody.setText(B.about + ' Remove it to get ' + B.cost + ' crates back.');
+      } else if (this.sel) {
+        const B = CT.BUILDINGS[this.sel];
+        this.pTitle.setText('PLACING: ' + B.name.toUpperCase() + ' (' + B.cost + ' crates)');
+        this.pBody.setText('Fits on: ' + B.allowedTags.join(' or ') + ' spots.' + (B.bonusTag ? ' Bonus on ' + B.bonusTag + ' spots!' : '') + ' Esc to cancel.');
+      } else if (!v.ok) {
+        this.pTitle.setText('BUILD THE OUTPOST');
+        this.pBody.setText('Pick a building card on the left. Still needed: ' + v.missing.map((t) => CT.BUILDINGS[t].short).join(', ') + '.');
+      } else {
+        this.pTitle.setText('READY FOR THE MISSION');
+        this.pBody.setText('All needed buildings are placed. Spend leftover crates on extras, or start the mission!');
+      }
+      this.updateFocus();
     }
 
-    finish(id) {
-      const S = NS.state, B = NS.BUILDINGS[id], site = this.sites[id];
-      S.built[id] = true;
-      S.res[B.grants] = true;
-      NS.retexture(site.img, 'building.' + id + '.ready');
-      const s0 = site.img.scaleX;
-      this.tweens.add({ targets: site.img, scaleX: s0 * 1.08, scaleY: s0 * 1.08, yoyo: true, duration: 180, ease: 'Sine.easeOut' });
-      NS.litChip(this, this.hud[B.grants], true);
-      this.refreshHud();
-      NS.toast(this, B.ready, NS.C.green);
-      this.guide.say(B.ready + '!');
-      this.dropRef = null;
-      this.ghost = null; this.pad = null;
-      this.sel = null;
-      this.setMode('idle');
-      if (this.worker) { const w = this.worker; this.time.delayedCall(T(900), () => w.walkTo(w.home.x, w.home.y)); }
-
-      // after a moment the building settles into its finished (idle) artwork
-      this.time.delayedCall(T(2600), () => this.settle(id));
-      if (NS.BUILD_ORDER.every((k) => S.built[k])) this.time.delayedCall(T(3400), () => this.win());
-      else this.hintNext();
-    }
-
-    settle(id) {
-      const site = this.sites[id];
-      if (!site || !site.img || !site.img.scene) return;
-      const old = site.img;
-      const idle = NS.put(this, 'building.' + id + '.idle', old.x, old.y).setDepth(old.depth).setAlpha(0);
-      this.tweens.add({ targets: idle, alpha: 1, duration: 500 });
-      this.tweens.add({ targets: old, alpha: 0, duration: 500, onComplete: () => old.destroy() });
-      site.img = idle;
-    }
-
-    hintNext() {
-      const S = NS.state;
-      const next = NS.BUILD_ORDER.find((k) => !S.built[k]);
-      if (!next) return;
-      this.time.delayedCall(T(1500), () => {
-        if (this.mode === 'idle') this.guide.say(next === 'greenhouse'
-          ? 'The Moon garden is next! It needs power and crew supplies.'
-          : 'Next up: ' + NS.BUILDINGS[next].name + '. Every part helps Moon Camp!');
+    updateFocus() {
+      const items = [this.btnStart.focusItem('start')];
+      if (this.btnRemove.visible) items.push(this.btnRemove.focusItem('remove'));
+      this.cards.forEach((c) => items.push({ id: 'card' + c.id, bounds: () => ({ x: c.x, y: c.y, w: CARD_W, h: CARD_H }), activate: () => this.selectCard(c.id) }));
+      NS.PADS.forEach((p, i) => {
+        if (this.sel || this.layout.some((b) => b.pad === i)) {
+          items.push({ id: 'pad' + i, bounds: () => ({ x: p.x - 86, y: p.y - 40, w: 172, h: 80 }), activate: () => { this.explainPad(i); this.onPad(i); } });
+        }
       });
+      this.focus.set(items);
     }
 
-    // ----------------------------------------------------------------- win
-    win() {
-      if (this.mode === 'won') return;
-      this.mode = 'won';
-      const D = 6000, cx = NS.W / 2;
-      const veil = this.add.rectangle(0, 0, NS.W, NS.H, 0x141a3d, 0.62).setOrigin(0).setDepth(D).setInteractive();
-      const pw = 800, ph = 420, px = cx - pw / 2, py = 150;
-      const pg = NS.panel(this, px, py, pw, ph, { r: 30 }).setDepth(D + 1);
-      NS.text(this, cx, py + 40, 'MOON CAMP IS READY!', 15, NS.C.slateHex).setOrigin(0.5).setDepth(D + 2);
-      NS.text(this, cx, py + 82, 'The crew is ready!', 44).setOrigin(0.5).setDepth(D + 2);
-      NS.text(this, cx, py + 128, 'Air, power, shelter, and the Moon garden are ready for a five-day adventure!', 19, NS.C.slateHex, '700')
-        .setOrigin(0.5).setDepth(D + 2);
-      NS.BUILD_ORDER.forEach((id, i) => {
-        const b = NS.put(this, 'building.' + id + '.idle', px + 100 + i * 150, py + 300).setDepth(D + 2);
-        b.setScale(0.3);
-        this.tweens.add({ targets: b, y: b.y - 8, yoyo: true, repeat: -1, duration: 1300 + i * 130, ease: 'Sine.easeInOut' });
-      });
-      const buttonWidth = Math.min(230, (pw - 80) / 3);
-      const buttonGap = 30;
-      const buttonStep = buttonWidth + buttonGap;
-      const buttonY = py + ph - 62;
-      const buttonHeight = Math.min(64, ph * 0.17);
-      const again = NS.textButton(this, cx - buttonStep, buttonY, buttonWidth, buttonHeight, 'Build again', () => this.restartBuild());
-      const mission = NS.textButton(this, cx, buttonY, buttonWidth, buttonHeight, 'Start mission', () => this.scene.start('Mission'), NS.C.green);
-      const back = NS.textButton(this, cx + buttonStep, buttonY, buttonWidth, buttonHeight, 'Explore again', () => this.scene.start('Explore'), NS.C.orange);
-      [again, mission, back].forEach((b) => b.setDepth(D + 2));
-      NS.text(this, cx, py + 405, 'Next: help the crew protect their first Moon garden experiment!', 13, NS.C.slateHex).setOrigin(0.5).setDepth(D + 2);
-      this.guide.say(NS.STORY.buildComplete);
-      this.wander();
-    }
-
-    restartBuild() {
-      const site = NS.state.site;
-      NS.state = NS.freshState();
-      NS.state.site = site;
-      this.scene.restart();
-    }
-
-    wander() {
-      this.time.addEvent({
-        delay: 1800, loop: true,
-        callback: () => {
-          const c = Phaser.Utils.Array.GetRandom(this.crew);
-          if (c._tw) return;
-          c.walkTo(Phaser.Math.Between(260, 1100), Phaser.Math.Between(570, 596));
-        },
-      });
-    }
-
-    // --------------------------------------------------------------- update
     update(time) {
       const g = this.ringG; g.clear();
-      const ph = time * 0.0004;
-      const B = this.sel && NS.BUILDINGS[this.sel];
-      this.pads.forEach((p) => {
-        // soft ground tint so sunny / shaded spots read at a glance
-        if (p.tags.indexOf('sunny') >= 0) g.fillStyle(NS.C.yellow, 0.16).fillEllipse(p.x, p.y, NS.PAD_RX * 2, NS.PAD_RY * 2);
-        if (p.tags.indexOf('shaded') >= 0) g.fillStyle(NS.C.navy, 0.2).fillEllipse(p.x, p.y, NS.PAD_RX * 2, NS.PAD_RY * 2);
-        const choosing = this.mode === 'select';
-        if (p.label) p.label.setVisible(choosing && !p.occupant);
-        if (p.occupant) return;
-        if (p === this.pad && this.mode !== 'idle') return; // ghost carries its own ring
-        if (choosing) {
-          const ok = this.padValid(p);
-          g.lineStyle(ok ? 4 : 3, ok ? 0x5fcf5f : 0xffffff, ok ? 1 : 0.35);
-          if (ok) g.fillStyle(0x8fe27a, 0.2).fillEllipse(p.x, p.y, NS.PAD_RX * 2, NS.PAD_RY * 2);
-          NS.dashedEllipse(g, p.x, p.y, NS.PAD_RX, NS.PAD_RY, ok ? ph : 0, 30, 0.6);
+      const ph = time * 0.0005;
+      NS.PADS.forEach((p, i) => {
+        if (this.layout.some((b) => b.pad === i)) return;
+        const tags = this.tags[i];
+        if (tags.includes('sunny')) g.fillStyle(NS.C.yellow, 0.18).fillEllipse(p.x, p.y, NS.PAD_RX * 2, NS.PAD_RY * 2);
+        if (tags.includes('shaded')) g.fillStyle(NS.C.ink, 0.25).fillEllipse(p.x, p.y, NS.PAD_RX * 2, NS.PAD_RY * 2);
+        if (this.sel) {
+          const ok = NS.ENGINE.canPlace(this.M.id, NS.run.siteId, this.layout, this.sel, i).ok;
+          const hov = this.hoverPad === i;
+          g.lineStyle(hov ? 6 : 4, ok ? NS.C.green : NS.C.orange, ok ? 1 : 0.55);
+          NS.dashedEllipse(g, p.x, p.y, NS.PAD_RX, NS.PAD_RY, ok ? ph * 2 : 0, 30, 0.6);
+          if (ok) g.fillStyle(NS.C.green, hov ? 0.32 : 0.15).fillEllipse(p.x, p.y, NS.PAD_RX * 2, NS.PAD_RY * 2);
         } else {
-          g.lineStyle(2, 0xffffff, 0.35);
+          g.lineStyle(3, 0xffffff, 0.6);
           NS.dashedEllipse(g, p.x, p.y, NS.PAD_RX, NS.PAD_RY, 0, 30, 0.55);
         }
       });

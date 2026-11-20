@@ -4,3 +4,12 @@
 # Python-generated cache files.
 __pycache__/
 *.py[cod]
+
+# Blender intermediate renders (regenerate with npm run art)
+tools/blender/_out/
+
+# Playtest screenshots
+test-shots/
+
+# Node
+node_modules/

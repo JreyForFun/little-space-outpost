@@ -1,142 +1,189 @@
 #!/usr/bin/env python3
-"""Headless playthrough of Explore + Build. Usage: python3 tools/playtest.py <shots_dir> [port]"""
-import sys, os, json
+"""Headless end-to-end playtest: Title -> Campaign -> Briefing -> Explore -> Build -> Mission -> Results,
+plus Ask Mission Control (Moon instant / Mars delayed), lose-and-rewind, LIVE vs offline space weather,
+the Journal, and screenshots of every mission.
+
+Usage:  python tools/playtest.py <shots_dir> [port]
+Needs the game served over HTTP (python -m http.server 8000) and Playwright:
+  python -m pip install playwright && python -m playwright install chromium
+NASA requests are intercepted: one run gets a fake LIVE answer, others simulate being offline,
+so the test never uses the real API quota.
+"""
+import json
+import os
+import sys
+
 from playwright.sync_api import sync_playwright
 
-SHOTS = sys.argv[1]
-PORT = sys.argv[2] if len(sys.argv) > 2 else "8765"
+SHOTS = sys.argv[1] if len(sys.argv) > 1 else "test-shots"
+PORT = sys.argv[2] if len(sys.argv) > 2 else "8000"
+BASE = f"http://127.0.0.1:{PORT}/play.html"
 os.makedirs(SHOTS, exist_ok=True)
-errors = []
+errors, log = [], []
+FAKE_DONKI = [{"messageType": "FLR", "messageURL": "https://example.invalid", "messageBody":
+               "Flare peak time: 2026-11-12T08:15Z.\n\nFlare intensity: X1.9 class.\n\nSource region: S10W20 (Active Region 14321)\n\nActivity ID: 2026-11-12T07:55:00-FLR-001.\n"}]
+
+
+def check(label, cond, info=""):
+    log.append(("PASS" if cond else "FAIL", label, info))
 
 
 def run():
     with sync_playwright() as p:
-        b = p.chromium.launch(args=["--use-gl=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"])
+        b = p.chromium.launch(args=["--use-angle=d3d11", "--enable-gpu", "--ignore-gpu-blocklist"])
         pg = b.new_page(viewport={"width": 1280, "height": 720})
-        pg.on("console", lambda m: errors.append(f"console.{m.type}: {m.text}") if m.type in ("error", "warning") else None)
+        pg.on("console", lambda m: errors.append(f"console.{m.type}: {m.text}") if m.type == "error" else None)
         pg.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
-        pg.on("requestfailed", lambda r: errors.append(f"requestfailed: {r.url}"))
-        pg.goto(f"http://localhost:{PORT}/play.html?fast")
+        mode = {"live": True}
+        pg.route("**/api.nasa.gov/**", lambda r: r.fulfill(status=200, content_type="application/json", body=json.dumps(FAKE_DONKI))
+                 if mode["live"] else r.fulfill(status=503, body="offline (simulated by playtest)"))
 
-        def shot(name):
-            pg.screenshot(path=os.path.join(SHOTS, name + ".png"))
+        shot = lambda name: pg.screenshot(path=os.path.join(SHOTS, name + ".png"))
+        js = pg.evaluate
 
-        def wait_scene(key, timeout=15000):
+        def wait_scene(key, timeout=20000):
             pg.wait_for_function(f"window.__outpost && window.__outpost.game && window.__outpost.game.scene.isActive('{key}')", timeout=timeout)
+            pg.wait_for_timeout(600)
 
-        def click(x, y, wait=250):
+        def click(x, y, wait=350):
             pg.mouse.click(x, y)
             pg.wait_for_timeout(wait)
 
-        def st(scene):
-            return             pg.evaluate(f"(() => {{ const s = window.__outpost.{scene}; return {{mode: s.mode, sel: s.sel || null, built: window.__outpost.NS.state.built, res: window.__outpost.NS.state.res, mission: s.mission || null}}; }})()")
-
-        log = []
-        def check(label, cond, info=""):
-            log.append(("PASS" if cond else "FAIL", label, info))
-
-        # ---------------- EXPLORE
+        # ------------------------------------------------ fresh start, LIVE space weather (mocked)
+        pg.goto(BASE + "?fast&seed=7")
+        js("localStorage.clear()")
+        pg.goto(BASE + "?fast&seed=7")
+        wait_scene("Title")
+        pg.wait_for_function("window.__outpost.NS.live.status === 'live'", timeout=10000)
+        pg.wait_for_timeout(900)
+        shot("01_title")
+        check("title: LIVE space weather card", js("window.__outpost.NS.live.summary().label") == "LIVE")
+        click(640, 280, 900)
+        wait_scene("Campaign")
+        shot("02_campaign")
+        check("campaign: only mission 1 unlocked", js("window.__outpost.NS.save.data.unlocked") == 1)
+        click(1150, 280, 900)
+        wait_scene("Briefing")
+        pg.wait_for_timeout(400)
+        shot("03_briefing")
+        pg.keyboard.press("Enter"); pg.keyboard.press("Enter"); pg.wait_for_timeout(300)
+        check("briefing: dialogue advances", js("window.__outpost.briefing.i") >= 1)
+        click(1180, 50, 900)
         wait_scene("Explore")
-        pg.wait_for_timeout(1500)
-        shot("01_explore_start")
-        click(480, 420, 100)                      # D: crater rim (blocked)
-        pg.wait_for_timeout(500); shot("02_explore_scanning")
-        pg.wait_for_timeout(1200); shot("03_explore_blocked")
-        check("blocked site -> result mode", st("explore")["mode"] == "result")
-        click(1150, 660)                          # Cancel
-        check("cancel -> pick mode", st("explore")["mode"] == "pick")
-        click(300, 500, 1600); shot("04_explore_ok")   # A: ok
-        check("open site -> result mode", st("explore")["mode"] == "result")
-        click(905, 660, 700); shot("05_explore_confirmed")
-        check("confirm -> done mode", st("explore")["mode"] == "done")
-        pg.wait_for_timeout(1800)
-        click(1060, 660, 300)                     # Start building
-        wait_scene("Build"); pg.wait_for_timeout(1200)
-        shot("06_build_start")
+        shot("04_explore")
+        click(480, 420, 1600)  # Crater Rim (unsafe)
+        check("explore: unsafe site -> result", js("window.__outpost.explore.mode") == "result")
+        click(1166, 646, 400)  # Back
+        click(300, 500, 1600)  # Landing Flats
+        click(960, 646, 900)  # Land here
+        check("explore: site chosen", js("window.__outpost.NS.run.siteId") == "flats")
+        shot("05_explore_landed")
+        click(1080, 646, 900)
+        wait_scene("Build")
 
-        # ---------------- BUILD
-        def build_one(card_i, pad, shot_prefix=None, expect_invalid_pad=None):
-            click(95, 175 + card_i * 97)
-            if shot_prefix: shot(shot_prefix + "_a_selected")
-            click(860, 660)                       # Select location
-            check(f"card {card_i}: select mode", st("build")["mode"] == "select")
-            if shot_prefix: pg.mouse.move(pad[0], pad[1]); pg.wait_for_timeout(300); shot(shot_prefix + "_b_selecting")
-            if expect_invalid_pad:
-                click(*expect_invalid_pad, 400)
-                check(f"card {card_i}: invalid pad rejected", st("build")["mode"] == "select")
-                if shot_prefix: shot(shot_prefix + "_b2_invalid")
-            click(*pad)
-            check(f"card {card_i}: located", st("build")["mode"] == "located", json.dumps(st("build")))
-            if shot_prefix: shot(shot_prefix + "_c_located")
-
-        # 1 Crew habitat on flat pad (610,410); try sunny-only pad (840,410) first -> invalid
-        build_one(0, (610, 410), "07_crew", expect_invalid_pad=(840, 410))
-        click(860, 660, 300); shot("07_crew_d_building")
-        pg.wait_for_function("window.__outpost.NS.state.built.crew === true", timeout=8000)
-        pg.wait_for_timeout(500); shot("07_crew_e_ready")
-        check("crew built, supplies on", st("build")["res"]["supplies"] is True)
-
-        # Greenhouse early: located but locked
-        build_one(4, (945, 540), "08_gh_locked")
-        click(860, 660, 300)
-        check("greenhouse locked without power", st("build")["mode"] == "located", json.dumps(st("build")))
-        click(1150, 660, 300)                     # cancel -> back to select
-        check("cancel located -> select", st("build")["mode"] == "select")
-        click(1150, 660, 200)                     # cancel select -> selected
-        click(1150, 660, 200)                     # cancel selected -> idle
-        check("back to idle", st("build")["mode"] == "idle")
-
-        # 2 Oxygen
-        build_one(1, (495, 540), "09_oxygen")
-        click(860, 660)
-        pg.wait_for_function("window.__outpost.NS.state.built.oxygen === true", timeout=8000)
-        # 3 Solar (sunny pad)
-        build_one(2, (840, 410), "10_solar", expect_invalid_pad=(495 + 0, 540 + 0))  # 495,540 now occupied/not sunny
-        click(860, 660)
-        pg.wait_for_function("window.__outpost.NS.state.built.solar === true", timeout=8000)
-        # 4 Shelter (shaded pad)
-        build_one(3, (1070, 410), "11_shelter")
-        click(860, 660)
-        pg.wait_for_function("window.__outpost.NS.state.built.shelter === true", timeout=8000)
-        pg.wait_for_timeout(3200); shot("12_four_built")
-        # 5 Greenhouse now unlocked
-        build_one(4, (945, 540), "13_gh_unlocked")
-        click(860, 660, 300); shot("13_gh_building")
-        pg.wait_for_function("window.__outpost.NS.state.built.greenhouse === true", timeout=8000)
-        pg.wait_for_timeout(600); shot("14_gh_ready")
-        pg.wait_for_timeout(3500); shot("15_victory")
-        check("victory shown", st("build")["mode"] == "won", json.dumps(st("build")))
-        buttons = pg.evaluate("window.__outpost.build.children.list.filter(o => o.type === 'Container').slice(-3).map(o => ({x: o.x, width: o.width}))")
-        no_overlap = len(buttons) == 3 and all(
-            buttons[i]["x"] + buttons[i]["width"] / 2 <= buttons[i + 1]["x"] - buttons[i + 1]["width"] / 2
-            for i in range(len(buttons) - 1)
-        )
-        check("completion buttons do not overlap", no_overlap, json.dumps(buttons))
-        shot("16_final")
-
-        # ---------------- MISSION
-        click(640, 510, 500)                     # Start mission
+        # ------------------------------------------------ build (mission 1 cards: crew, solar, battery, oxygen)
+        def card(i): click(24 + 100, 124 + i * 68 + 31, 400)
+        pads = [(380, 410), (610, 410), (840, 410), (1070, 410), (270, 540), (495, 540), (720, 540), (945, 540), (1160, 540)]
+        def pad(i): click(pads[i][0], pads[i][1] - 6, 700)
+        card(0); pad(3)
+        check("build: habitat rejected on shaded pad", len(js("window.__outpost.build.layout")) == 0)
+        pad(1); card(1); pad(2); card(3); pad(5); card(2); pad(7)
+        check("build: 4 buildings placed", len(js("window.__outpost.build.layout")) == 4)
+        shot("06_build_done")
+        click(1120, 660, 900)
         wait_scene("Mission")
-        check("mission starts with five days", st("mission")["mission"]["day"] == 1)
-        shot("17_mission_start")
-        for _ in range(5):
-            mission = pg.evaluate("window.__outpost.mission.mission")
-            if mission["day"] == mission["stormDay"] - 1 and mission["power"] >= 2:
-                x = 1035                               # Charge the shelter for the alert
-            elif mission["power"] >= 2 and mission["day"] < 4:
-                x = 245                                # Grow food
-            else:
-                x = 640                                # Save power
-            click(x, 570, 250)
-            after = st("mission")["mission"]
-            check(f"mission day {mission['day']} resolves", after["day"] > mission["day"] or after["mode"] != "playing")
-        check("five-day mission completes", st("mission")["mission"]["mode"] == "complete", json.dumps(st("mission")["mission"]))
-        shot("18_mission_complete")
+        shot("07_mission_day1")
+        check("mission: only 3 core meters", sorted(js("Object.keys(window.__outpost.mission.meters)")) == ["air", "food", "power"])
+
+        # Ask Mission Control on the Moon: instant (after the light-time animation)
+        click(1096, 596, 1200)
+        pg.wait_for_function("!!window.__outpost.mission.overlayParts", timeout=8000)
+        shot("08_mission_control")
+        check("moon: advice arrives the same day", js("window.__outpost.mission.state.advice.used") == 1)
+        pg.keyboard.press("Enter"); pg.wait_for_timeout(400)
+
+        for d in range(10):
+            if not js("window.__outpost.game.scene.isActive('Mission')"):
+                break
+            click(1096, 664, 900)
+            if d == 0:
+                pg.wait_for_timeout(400); shot("09_mission_report")
+            pg.keyboard.press("Enter"); pg.wait_for_timeout(700)
+        wait_scene("Results")
+        pg.wait_for_timeout(1500)
+        shot("10_results_win")
+        stars = js("window.__outpost.lastStars")
+        check("mission 1 won with stars", stars >= 1, f"stars={stars}")
+        check("progress saved (mission 2 unlocked)", js("JSON.parse(localStorage.getItem('lso.save.v2')).unlocked") == 2)
+        check("journal entries unlocked", len(js("window.__outpost.NS.save.data.logbook")) >= 3)
+
+        # ------------------------------------------------ storm mission with LIVE flares -> labelled LIVE
+        pg.goto(BASE + "?fast&scene=mission&mission=3&seed=4")
+        wait_scene("Mission")
+        src = js("window.__outpost.mission.state.events.filter(e => e.type === 'storm').map(e => e.source)")
+        check("live: storms come from today's (mocked) DONKI flares", bool(src) and all(s == "LIVE" for s in src), str(src))
+        shot("11_mission_live_storm")
+
+        # ------------------------------------------------ offline: archive/practice fallback, never blocks
+        mode["live"] = False
+        js("localStorage.removeItem('lso.live.v1')")
+        pg.goto(BASE + "?fast&scene=mission&mission=3&seed=4")
+        wait_scene("Mission")
+        pg.wait_for_timeout(1500)
+        src = js("window.__outpost.mission.state.events.filter(e => e.type === 'storm').map(e => e.source)")
+        check("offline: storms fall back to ARCHIVE/PRACTICE", bool(src) and all(s in ("ARCHIVE", "PRACTICE") for s in src), str(src))
+
+        # ------------------------------------------------ Mars: advice is delayed one day
+        pg.goto(BASE + "?fast&scene=mission&mission=6&seed=2")
+        wait_scene("Mission")
+        click(1096, 596, 700)
+        check("mars: advice is pending (radio delay)", bool(js("window.__outpost.mission.state.advice.pending")))
+        click(1096, 664, 900); pg.keyboard.press("Enter"); pg.wait_for_timeout(700)
+        check("mars: reply arrives next day", bool(js("window.__outpost.mission.state.advice.ready")))
+        shot("12_mars")
+
+        # ------------------------------------------------ lose, then rewind
+        pg.goto(BASE + "?fast&scene=mission&mission=1&seed=1")
+        wait_scene("Mission")
+        js("window.__outpost.mission.plan.on.oxygen = false; window.__outpost.mission.refresh()")
+        for d in range(10):
+            if not js("window.__outpost.game.scene.isActive('Mission')"):
+                break
+            pg.keyboard.press("e"); pg.wait_for_timeout(700)
+            pg.keyboard.press("Enter"); pg.wait_for_timeout(600)
+        wait_scene("Results")
+        shot("13_results_lost")
+        check("neglect: mission lost", js("window.__outpost.NS.run.history.slice(-1)[0].status") == "lost")
+        js("window.__outpost.results.rewind()")
+        wait_scene("Mission")
+        check("rewind: back in the mission", js("window.__outpost.mission.state.status") == "playing")
+
+        # ------------------------------------------------ journal + every mission base
+        pg.goto(BASE + "?fast&scene=journal")
+        wait_scene("Journal")
+        shot("14_journal")
+        js("window.__outpost.journal.tab = 'health'; window.__outpost.journal.draw()")
+        check("journal: OSDR studies listed", len(js("window.__outpost.journal.entries()")) >= 3)
+        for m in range(1, 7):
+            pg.goto(BASE + f"?fast&scene=mission&mission={m}&seed={m}")
+            wait_scene("Mission")
+            shot(f"20_mission{m}")
+            check(f"mission {m}: playable", js("window.__outpost.mission.state.status") == "playing")
         b.close()
 
-        for r in log: print(*r)
-        print("--- browser messages:", len(errors))
-        for e in errors[:25]: print("  ", e)
 
+try:
+    run()
+except Exception as e:
+    check("playtest crashed", False, repr(e))
 
-run()
+for status, label, info in log:
+    print(f"{status}  {label}  {info}")
+# the simulated-offline NASA response is expected; anything else is a real error
+real = [e for e in errors if "503" not in e]
+print("\nerrors:", len(real))
+for e in real[:30]:
+    print("  ", e)
+fails = sum(1 for s, _, _ in log if s == "FAIL")
+print(f"\n{len(log) - fails}/{len(log)} checks passed")
+sys.exit(1 if fails or real else 0)

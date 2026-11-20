@@ -3,10 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0e1230">
+  <meta name="theme-color" content="#140d3d">
   <title>Play Little Space Outpost</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%23b7b1e6' stroke='%23241a4f' stroke-width='5'/%3E%3Ccircle cx='24' cy='26' r='6' fill='%236f62b8'/%3E%3Ccircle cx='40' cy='40' r='8' fill='%236f62b8'/%3E%3C/svg%3E">
   <style>
-    html, body { margin: 0; height: 100%; background: #0e1230; overflow: hidden; }
+    @font-face { font-family: 'Fredoka'; src: url('assets/fonts/Fredoka.ttf') format('truetype'); font-weight: 300 700; font-display: block; }
+    @font-face { font-family: 'Nunito'; src: url('assets/fonts/Nunito.ttf') format('truetype'); font-weight: 200 1000; font-display: block; }
+    html, body { margin: 0; height: 100%; background: #140d3d; overflow: hidden; }
     #game { width: 100vw; height: 100vh; }
     canvas { display: block; touch-action: none; -webkit-tap-highlight-color: transparent; }
   </style>
@@ -14,13 +17,29 @@
 <body>
   <div id="game" aria-label="Little Space Outpost game"></div>
   <script src="lib/phaser.min.js"></script>
+  <!-- game rules + real NASA data (pure JS, also used by the Node tests) -->
+  <script src="src/sim/content.js"></script>
+  <script src="src/data/donki-events.js"></script>
+  <script src="src/sim/engine.js"></script>
+  <script src="src/sim/save.js"></script>
+  <script src="src/data/logbook.js"></script>
+  <script src="src/data/osdr-studies.js"></script>
+  <script src="src/data/story.js"></script>
+  <!-- view layer -->
   <script src="src/assets.js"></script>
   <script src="src/data.js"></script>
   <script src="src/ui.js"></script>
+  <script src="src/audio.js"></script>
+  <script src="src/live.js"></script>
   <script src="src/scenes/BootScene.js"></script>
+  <script src="src/scenes/TitleScene.js"></script>
+  <script src="src/scenes/CampaignScene.js"></script>
+  <script src="src/scenes/BriefingScene.js"></script>
   <script src="src/scenes/ExploreScene.js"></script>
   <script src="src/scenes/BuildScene.js"></script>
   <script src="src/scenes/MissionScene.js"></script>
+  <script src="src/scenes/ResultsScene.js"></script>
+  <script src="src/scenes/JournalScene.js"></script>
   <script src="src/main.js"></script>
 </body>
 </html>
